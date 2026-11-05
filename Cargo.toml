@@ -1,0 +1,25 @@
+[package]
+name = "blackbox-injector"
+version = "1.0.0"
+edition = "2021"
+description = "BlackBox Injector - native Win32 DLL injector"
+build = "build.rs"
+
+[[bin]]
+name = "BlackBoxInjector"
+path = "src/main.rs"
+
+[features]
+hijack_debug = []
+# Test builds: request asInvoker instead of requireAdministrator and skip the elevation check,
+# so the automated tests can start the exe from an unelevated session.
+no_elevation = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = 1
+
