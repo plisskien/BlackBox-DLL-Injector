@@ -10,7 +10,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-2021-ea7233?style=flat-square" alt="Rust 2021">
   <img src="https://img.shields.io/badge/Windows-10_%7C_11-0078D4?style=flat-square" alt="Windows 10 | 11">
-  <img src="https://img.shields.io/badge/Version-1.0.0-059669?style=flat-square" alt="Version 1.0.0">
+  <img src="https://img.shields.io/badge/Version-1.0.1-059669?style=flat-square" alt="Version 1.0.1">
 </p>
 
 Native Windows DLL injection and diagnostic tool written in pure Rust. Supports native x64 and 32-bit WOW64 processes with 6 injection methods, in-memory cloaking, automated crash diagnostics, and scriptable CLI automation.
@@ -20,6 +20,7 @@ Native Windows DLL injection and diagnostic tool written in pure Rust. Supports 
 - Windows 10 / 11 (x64)
 - Administrator privileges (for `SeDebugPrivilege` and cross-process handle acquisition)
 - Rust 1.70+ and MSVC C++ Build Tools (only required to compile from source)
+- The TLS seed base DLL is shipped prebuilt in `seed/` next to its source; see `seed/README.md`.
 
 ## Quick Start
 
@@ -63,6 +64,7 @@ BlackBoxInjector.exe --proc target.exe --validate
 - Allocates memory for the DLL path in the target process via `VirtualAllocEx(PAGE_READWRITE)`.
 - Writes the UTF-16 path via `WriteProcessMemory`.
 - Resolves `kernel32.dll!LoadLibraryW` from the target's export table and spawns execution via `CreateRemoteThread`.
+- Captures the returned HMODULE through a remote stub and verifies the PE at that base, so a DLL that unlinks itself from the PEB is still reported correctly with its real base.
 
 ### Method 1: LdrLoadDll
 - Bypasses user-mode hooks placed on `kernel32!LoadLibraryW` by interacting directly with the native NT loader.
@@ -78,7 +80,7 @@ BlackBoxInjector.exe --proc target.exe --validate
   - **Import Resolution:** Parses `IMAGE_DIRECTORY_ENTRY_IMPORT`, walks Import Address Tables (IAT), recursively resolves forwarded exports (`ntdll.RtlXxx`), and maps dependencies via remote export directory inspection and PEB `ApiSetMap` lookup (`api-ms-win-*` -> host module). Imports are always resolved against the *target's* export tables.
   - **Protections:** Each section receives its final protection (RX/RW/RO/NOACCESS) *before* any of the image runs; the header page ends up read-only.
   - **Exception data (x64):** The image's `.pdata` is registered with `RtlAddFunctionTable`, and the image is also inserted into `ntdll!KiUserInvertedFunctionTable` (the table `RtlPcToFileHeader` and the MSVC C++ runtime read). That makes both `__try/__except` and C++ `throw`/`catch` work inside a manually mapped module - without it the C++ runtime cannot resolve its FuncInfo RVAs and a `throw` terminates the target.
-  - **TLS:** A real, minimal helper module (`assets/tls_seed.dll`, embedded in the injector) carries the payload's TLS template and is loaded into the target; the loader assigns the index and fills a block for **every** thread - including threads that already exist and threads the payload creates later. The payload's `AddressOfIndex` is pointed at that loader index and its TLS callbacks run before `DllMain`. This is what makes `thread_local` work on worker threads the payload spawns after initialisation.
+  - **TLS:** The injector builds a real helper module for the payload at injection time: it takes a working base DLL, appends a `.tlsp` section sized exactly to the payload's TLS template, and points the TLS directory at it. The loader assigns the index and fills a block of exactly that size for **every** thread - including threads that already exist and threads the payload creates later. The payload's `AddressOfIndex` is pointed at that loader index and its TLS callbacks run before `DllMain`. This is what makes `thread_local` work on worker threads the payload spawns after initialisation, and there is no fixed template capacity; the only limits are disk space for the temporary seed and the loader's own allocation.
   - **Entry Point:** Dispatches the module's `DllMain(DLL_PROCESS_ATTACH)` via a native remote stub. `AddressOfEntryPoint == 0` (resource-only DLL) is skipped, and a `FALSE` return is treated as a failed load (the image is freed again).
 
 ### Method 3: Thread Hijacking
@@ -90,6 +92,7 @@ BlackBoxInjector.exe --proc target.exe --validate
 ### Method 4: NtCreateThreadEx
 - Invokes undocumented native syscall `ntdll!NtCreateThreadEx`.
 - Passes the `THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER` creation flag to shield injection threads from attached debuggers and instrumentation engines.
+- Uses the same HMODULE capture and PE verification as Standard, so a self-unlinking DLL is not reported as a failed load.
 
 ### Method 5: APC (QueueUserAPC)
 - Threadless injection: enumerates existing threads in the target process.
@@ -138,7 +141,7 @@ Legend: **✅** supported and verified | **⚠️** supported with a caveat (see
 ### Notes & Limitations
 
 1. **APC on WOW64 is not possible:** A 64-bit process cannot queue a 32-bit routine onto a WOW64 thread; the 32-bit APC dispatcher faults (verified). 32-bit targets receive a clean error instead of a crashing target - use methods 0-4. APC also requires the target thread to enter an alertable wait state (`SleepEx`, `WaitForSingleObjectEx`).
-2. **Manual Map + Static TLS (`__declspec(thread)`):** TLS is loader-managed. A real, minimal helper module (`assets/tls_seed.dll`, embedded) carrying the payload's TLS template is loaded into the target, so the loader assigns a genuine `_tls_index` and fills a block for **every** thread - including threads created after injection. The payload's `AddressOfIndex` is pointed at that index and its TLS callbacks run before `DllMain`; no manual thread-array replacement is performed (that raced with the game's thread churn). Trade-off: the helper stays in the target's module list (loader-visible); its temp file is deleted after load. On 32-bit targets manual map still refuses a DLL with static TLS.
+2. **Manual Map + Static TLS (`__declspec(thread)`):** TLS is loader-managed. For each payload the injector builds a real helper module: a working base DLL gets an appended `.tlsp` section sized exactly to the payload's TLS template, and the TLS directory is pointed at it. The loader then assigns a genuine `_tls_index` and fills a block of exactly that size for **every** thread - including threads created after injection. The payload's `AddressOfIndex` is pointed at that index and its TLS callbacks run before `DllMain`; no manual thread-array replacement is performed (that raced with the game's thread churn). There is no fixed template capacity; the practical limits are disk space for the temporary seed and the loader's allocation. Trade-off: the helper stays in the target's module list (loader-visible), and its file stays on disk while the module is loaded. On 32-bit targets manual map still refuses a DLL with static TLS.
 3. **Manual Map + Exceptions (x64 vs WOW64):** On x64, SEH and C++ exceptions work: `.pdata` is registered via `RtlAddFunctionTable` and the image is added to `ntdll!KiUserInvertedFunctionTable` (used by `RtlPcToFileHeader` and the MSVC C++ runtime). On WOW64, the 32-bit dispatcher only accepts exception handlers from loader-registered modules; manual map refuses 32-bit images with exception directories. Use loader methods (0, 1, or 4) for 32-bit DLLs using exceptions.
 4. **Slow `DllMain` (> 60 s):** A `DllMain` exceeding the 60 s wait is reported as a failure and the mapped image is kept in target memory - it is never freed under a thread that may still be running inside it.
 5. **Hijack Stub Timeout (10 s):** Hijack waits 10 s for its stub. If `DllMain` blocks longer than that, context cannot be restored without risking loader lock deadlock; the thread is left untouched, a hard error is returned, and the target must be restarted.
@@ -187,31 +190,25 @@ Legend: **✅** supported and verified | **⚠️** supported with a caveat (see
   - When injecting a DLL that imports missing VC++ dependencies, an interactive prompt allows users to install the official Microsoft runtime in 1 click or cancel and proceed. Every subsequent injection attempt without the runtime installed prompts again. In headless CLI mode, `--install-redist` is the scriptable path.
 - **Real-Time Event Stream:** Built-in virtual console displaying color-coded status prefixes (`[+]` success, `[*]` info, `[-]` warning, `[!]` error) with multi-line selection and clipboard copy.
 
+## Changelog
+
+### 1.0.1
+- **Fixed:** manual map static TLS now builds a real seed DLL sized exactly to the payload's TLS template. No fixed capacity, no unsafe manual thread-array fallback.
+- **Fixed:** Standard and NtCreateThreadEx capture the 64-bit HMODULE through a remote stub and verify the PE at that base. DLLs that unlink themselves no longer produce a false "not in the module list" error.
+- **Fixed:** crash reports map the WER exception code and fault offset correctly; the module timestamp is no longer shown as the exception code.
+- **Fixed:** `--cli ... > log.txt` and pipes keep the caller's standard handles.
+- **Changed:** one embedded TLS base seed instead of a size ladder; smaller binary and no 128 KB ceiling.
+- **Added:** the TLS seed source (`seed/tls_seed.cpp`) and rebuild script (`seed/build.cmd`), so the prebuilt base DLL is reproducible and auditable.
+
+### 1.0.0
+- Initial release: six injection methods, manual map with TLS and C++ exception support, cloaking, crash diagnostics, CLI.
+
+Full version history: [CHANGELOG.md](CHANGELOG.md)
+
 ## Reporting Issues
 
-Bug reports and technical issues are tracked exclusively via **[GitHub Issues](https://github.com/plisskien/BlackBox-DLL-Injector/issues)**. Please do not report bugs on forum threads - reporting on GitHub ensures crashes and diagnostic dumps can be triaged and resolved directly in source code.
+Bug reports and technical issues are tracked via **[GitHub Issues](https://github.com/plisskien/BlackBox-DLL-Injector/issues)**. Please do not report bugs on forum threads - GitHub keeps crashes and diagnostic dumps together with the source.
 
-When opening an issue, please copy and fill out the template below:
+Click **New issue** and choose **Bug Report**: GitHub loads `.github/ISSUE_TEMPLATE/bug_report.md` automatically, including the environment, diagnostic-report and activity-log fields.
 
-````markdown
-### Environment
-- OS: [e.g. Windows 11 24H2 Build 26100]
-- Target Process: [e.g. game.exe (x64) / app.exe (WOW64)]
-- Injection Method: [e.g. Method 2 - Manual Map]
-- Mode: [GUI / CLI]
-
-### Description
-[Describe the bug: error code, target crash, freeze, or unexpected behavior]
-
-### Diagnostic Report
-<!-- Click "Copy report" in the failure/crash dialog or copy from %TEMP%\BlackBoxInjector\reports\ -->
-```text
-=== BlackBox Injector crash report ===
-[Paste report here]
-```
-
-### Activity Log
-```text
-[Paste UI virtual console or terminal log here]
-```
-````
+Before submitting, attach the newest report from `%TEMP%\BlackBoxInjector\reports\` and the log from the UI console or terminal. Both make triage much faster.

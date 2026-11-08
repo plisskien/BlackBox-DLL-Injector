@@ -1,4 +1,4 @@
-﻿//! Method 2: Manual Map - in-memory PE loader and relocator.
+//! Method 2: Manual Map - in-memory PE loader and relocator.
 //!
 //! The image is mapped, relocated and import-resolved locally, then written to the target
 //! in one shot. Initialisation then follows the loader's order:
@@ -444,16 +444,17 @@ fn setup_tls(
         return Ok(None);
     }
 
-    // Preferred path (x64): let the loader own the index and the per-thread blocks. A real,
-    // minimal MSVC-built DLL (embedded as `assets/tls_seed.dll`) carries a 0x2000-byte static
-    // TLS template; we patch that template with the payload's bytes and LoadLibrary it in the
-    // target. The loader assigns a genuine `_tls_index` and fills a block for every thread,
-    // including threads that already exist (verified with a probe) and every future one. That
-    // removes all manual thread-array surgery - which raced with the game's own thread churn
-    // and corrupted its heap. A synthetic PE does not work here (the loader ignores its TLS
-    // directory), which is why a real DLL is embedded.
+    // Preferred path (x64): let the loader own the index and the per-thread blocks. The base
+    // seed is a real MSVC-built DLL (`seed/tls_seed_base.dll`, embedded) with a 0x2000-byte
+    // static TLS template. For each payload a `.tlsp` section sized exactly to its template is
+    // appended, the TLS directory Start/End/ZeroFill are patched and the entry point is replaced
+    // with a `mov eax,1; ret` stub. The loader assigns a genuine `_tls_index` and fills a block of
+    // exactly the payload's size for every thread, including threads that already exist and every
+    // future one. That removes all manual thread-array surgery, which raced with the game's own
+    // thread churn. A synthetic PE does not work here (the loader ignores its TLS directory), which
+    // is why a real DLL is embedded.
     if arch == Arch::X64 {
-        match install_tls_seed(h, arch, &template, log) {
+        match install_tls_seed(h, arch, &template, dir.size_of_zero_fill, log) {
             Ok((idx, seed_base)) => {
                 if dir.address_of_index != 0 {
                     remote_write(h, dir.address_of_index as usize, &idx.to_le_bytes())?;
@@ -480,9 +481,16 @@ fn setup_tls(
                 }
                 return Ok(Some(t));
             }
-            Err(e) => log(&format!(
-                "[!] TLS seed module unavailable ({e}); falling back to manual TLS seeding"
-            )),
+            Err(e) => {
+                if arch == Arch::X64 {
+                    return Err(format!(
+                        "TLS seed module unavailable ({e}); refusing the unsafe manual TLS fallback on x64"
+                    ));
+                }
+                log(&format!(
+                    "[!] TLS seed module unavailable ({e}); falling back to manual TLS seeding"
+                ));
+            }
         }
     }
 
@@ -615,14 +623,31 @@ fn alloc_tls_block(
     }
     Ok(p)
 }
-// ===== loader-managed static TLS via a real embedded seed DLL =====
+// ===== loader-managed static TLS via a dynamically sized real seed DLL =====
 //
 // A synthetic PE does not work: the loader accepts the module but never writes its
 // `_tls_index` nor copies its template into per-thread blocks (verified with a probe). A real
-// MSVC-built DLL does get both. `assets/tls_seed.dll` is such a DLL with a 0x2000-byte static
-// TLS template; its DllMain only reads the template, so patched bytes stay intact.
+// MSVC-built DLL does get both. So the injector takes a real base DLL and appends a `.tlsp`
+// section sized exactly to the payload's TLS template, patches the TLS directory Start/End/
+// ZeroFill and the entry point to a `mov eax,1; ret` stub (the base CRT never runs and there are
+// no TLS callbacks). The loader then assigns a genuine index and allocates exactly the payload's
+// block for existing and future threads. There is no template capacity limit; the only bounds are
+// disk space for the temporary seed and the loader's own TLS allocation.
 
-const TLS_SEED_DLL: &[u8] = include_bytes!("../../assets/tls_seed.dll");
+const TLS_SEED_BASE: &[u8] = include_bytes!("../../seed/tls_seed_base.dll");
+
+fn seed_align(v: usize, a: usize) -> usize {
+    (v + a - 1) & !(a - 1)
+}
+fn seed_put_u16(d: &mut [u8], o: usize, v: usize) {
+    d[o..o + 2].copy_from_slice(&(v as u16).to_le_bytes());
+}
+fn seed_put_u32(d: &mut [u8], o: usize, v: usize) {
+    d[o..o + 4].copy_from_slice(&(v as u32).to_le_bytes());
+}
+fn seed_put_u64(d: &mut [u8], o: usize, v: u64) {
+    d[o..o + 8].copy_from_slice(&v.to_le_bytes());
+}
 
 fn seed_u16(d: &[u8], o: usize) -> usize {
     u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as usize
@@ -663,34 +688,71 @@ fn pe_rva_to_off(data: &[u8], rva: usize) -> Option<usize> {
     None
 }
 
-/// (file offset, size) of the seed DLL's TLS template inside the embedded file.
-fn seed_template_span() -> Result<(usize, usize), String> {
-    let d = TLS_SEED_DLL;
-    if d.len() < 0x100 || &d[0..2] != b"MZ" {
-        return Err("embedded TLS seed is not a PE file".into());
+/// Append a `.tlsp` section that holds exactly this payload's TLS template and a `mov eax,1; ret`
+/// entry stub, then point the base seed's TLS directory at it. The base image is a real, working
+/// DLL, so the loader processes the TLS directory and fills blocks for every thread.
+fn build_dynamic_seed(template: &[u8], zero_fill: u32) -> Result<Vec<u8>, String> {
+    let base = TLS_SEED_BASE;
+    if base.len() < 0x200 || &base[0..2] != b"MZ" {
+        return Err("embedded TLS base seed is not a PE file".into());
     }
-    let pe = seed_u32(d, 0x3C);
+    let pe = seed_u32(base, 0x3C);
     let opt = pe + 24;
+    if seed_u16(base, opt) != 0x20B {
+        return Err("embedded TLS base seed is not PE32+".into());
+    }
+    let nsec = seed_u16(base, pe + 6);
+    let opt_size = seed_u16(base, pe + 20);
+    let sec_table = opt + opt_size;
+    let image_base = seed_u64(base, opt + 24);
+    let size_image = seed_u32(base, opt + 56);
+    let sec_align = seed_u32(base, opt + 32);
+    let file_align = seed_u32(base, opt + 36).max(0x200);
+    let size_headers = seed_u32(base, opt + 60);
     let dd = opt + 112;
-    if dd + 9 * 8 + 8 > d.len() {
-        return Err("embedded TLS seed has no data directories".into());
-    }
-    let tls_rva = seed_u32(d, dd + 9 * 8);
+    let tls_rva = seed_u32(base, dd + 9 * 8);
     if tls_rva == 0 {
-        return Err("embedded TLS seed has no TLS directory".into());
+        return Err("embedded TLS base seed has no TLS directory".into());
     }
-    let tls_off = pe_rva_to_off(d, tls_rva).ok_or("TLS directory RVA is unmapped")?;
-    if tls_off + 0x28 > d.len() {
+    let tls_off = pe_rva_to_off(base, tls_rva).ok_or("TLS directory RVA is unmapped")?;
+    if tls_off + 0x28 > base.len() {
         return Err("TLS directory is truncated".into());
     }
-    let image_base = seed_u64(d, opt + 24) as usize;
-    let start = seed_u64(d, tls_off) as usize;
-    let end = seed_u64(d, tls_off + 8) as usize;
-    if end <= start || image_base == 0 || start < image_base || end < image_base {
-        return Err("embedded TLS seed has an invalid template range".into());
+    let new_sec = sec_table + nsec * 40;
+    if new_sec + 40 > size_headers.max(base.len()) {
+        return Err("no room for another section header in the seed headers".into());
     }
-    let off = pe_rva_to_off(d, start - image_base).ok_or("TLS template RVA is unmapped")?;
-    Ok((off, end - start))
+
+    let stub: [u8; 6] = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]; // mov eax,1; ret
+    let stub_off = seed_align(template.len(), 16);
+    let vsize = stub_off + stub.len();
+    let raw_size = seed_align(vsize, file_align);
+    let new_va = seed_align(size_image, sec_align);
+    let new_image_size = seed_align(new_va + vsize, sec_align);
+
+    let mut d = base.to_vec();
+    seed_put_u64(&mut d, tls_off, image_base + new_va as u64);
+    seed_put_u64(&mut d, tls_off + 8, image_base + (new_va + template.len()) as u64);
+    seed_put_u64(&mut d, tls_off + 24, 0); // no TLS callbacks: the base CRT must not run
+    seed_put_u32(&mut d, tls_off + 32, zero_fill as usize);
+    seed_put_u32(&mut d, opt + 16, new_va + stub_off);
+    seed_put_u32(&mut d, opt + 56, new_image_size);
+
+    let raw_ptr = seed_align(d.len(), file_align);
+    d[new_sec..new_sec + 8].copy_from_slice(b".tlsp\0\0\0");
+    seed_put_u32(&mut d, new_sec + 8, vsize);
+    seed_put_u32(&mut d, new_sec + 12, new_va);
+    seed_put_u32(&mut d, new_sec + 16, raw_size);
+    seed_put_u32(&mut d, new_sec + 20, raw_ptr);
+    seed_put_u32(&mut d, new_sec + 36, 0xE000_0040); // RWX data
+    seed_put_u16(&mut d, pe + 6, nsec + 1);
+
+    d.resize(raw_ptr, 0);
+    let mut raw = vec![0u8; raw_size];
+    raw[..template.len()].copy_from_slice(template);
+    raw[stub_off..stub_off + stub.len()].copy_from_slice(&stub);
+    d.extend_from_slice(&raw);
+    Ok(d)
 }
 
 /// Patch the embedded seed with the payload's TLS template, load it in the target and return
@@ -699,23 +761,18 @@ fn install_tls_seed(
     h: HANDLE,
     arch: Arch,
     template: &[u8],
+    zero_fill: u32,
     log: Logger,
 ) -> Result<(u32, usize), String> {
     if arch != Arch::X64 {
         return Err("only x64 has a loader-managed seed".into());
     }
-    let (off, size) = seed_template_span()?;
-    if template.len() > size {
-        return Err(format!(
-            "payload TLS template {:#x} exceeds the seed's {size:#x} bytes",
-            template.len()
-        ));
-    }
-    let mut bytes = TLS_SEED_DLL.to_vec();
-    bytes[off..off + template.len()].copy_from_slice(template);
-    for b in &mut bytes[off + template.len()..off + size] {
-        *b = 0;
-    }
+    let bytes = build_dynamic_seed(template, zero_fill)?;
+    log(&format!(
+        "[*] TLS seed: dynamic {:x} byte block ({} byte template + {zero_fill} zero-fill)",
+        template.len() + zero_fill as usize,
+        template.len()
+    ));
     let mods = remote_modules(h, arch)?;
     let kernel = find_module(&mods, "kernel32.dll").ok_or("kernel32.dll not found in target")?;
     let loadlib = remote_export(h, arch, kernel.base, "LoadLibraryW", 0)?;
@@ -723,13 +780,35 @@ fn install_tls_seed(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = format!(
-        "{}\\bb_tlsseed_{}_{}.dll",
-        std::env::temp_dir().display(),
-        std::process::id(),
-        unique
-    );
-    std::fs::write(&path, &bytes).map_err(|e| format!("cannot write TLS seed: {e}"))?;
+    let file = format!("bb_tlsseed_{}_{}.dll", std::process::id(), unique);
+    let mut wrote: Option<std::path::PathBuf> = None;
+    let mut errs: Vec<String> = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(std::path::PathBuf::from(local).join("BlackBoxInjector"));
+    }
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        dirs.push(exe_dir);
+    }
+    for dir in dirs {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            errs.push(format!("mkdir {}: {e}", dir.display()));
+        }
+        let candidate = dir.join(&file);
+        match std::fs::write(&candidate, &bytes) {
+            Ok(()) => {
+                wrote = Some(candidate);
+                break;
+            }
+            Err(e) => errs.push(format!("{}: {e}", candidate.display())),
+        }
+    }
+    let path = wrote
+        .map(|p| p.to_string_lossy().to_string())
+        .ok_or_else(|| format!("cannot write TLS seed ({})", errs.join("; ")))?;
     let name = std::path::Path::new(&path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())

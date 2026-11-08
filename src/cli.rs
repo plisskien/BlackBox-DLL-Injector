@@ -42,8 +42,18 @@ const STD_ERROR_HANDLE: u32 = -12i32 as u32;
 /// Connects the process to the calling console or allocates one so CLI output is visible.
 pub fn ensure_console() {
     unsafe {
+        // AttachConsole/AllocConsole replace the standard handles with the console's, which
+        // would lose a caller's redirection. Save them and restore them afterwards.
+        let before_out = kernel32::GetStdHandle(STD_OUTPUT_HANDLE);
+        let before_err = kernel32::GetStdHandle(STD_ERROR_HANDLE);
         if kernel32::AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             kernel32::AllocConsole();
+        }
+        if !before_out.is_null() && before_out != crate::win32::INVALID_HANDLE_VALUE {
+            kernel32::SetStdHandle(STD_OUTPUT_HANDLE, before_out);
+        }
+        if !before_err.is_null() && before_err != crate::win32::INVALID_HANDLE_VALUE {
+            kernel32::SetStdHandle(STD_ERROR_HANDLE, before_err);
         }
         let h_out = kernel32::GetStdHandle(STD_OUTPUT_HANDLE);
         if h_out.is_null() || h_out == crate::win32::INVALID_HANDLE_VALUE {

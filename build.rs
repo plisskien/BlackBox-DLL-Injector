@@ -87,12 +87,12 @@ fn embed_icon_and_version(out_dir: &Path, ver_str: &str, v: (u32, u32, u32, u32)
              BEGIN\r\n\
                  BLOCK \"040904b0\"\r\n\
                  BEGIN\r\n\
-                     VALUE \"CompanyName\", \"BlackBox\"\r\n\
-                     VALUE \"FileDescription\", \"BlackBox Injector\"\r\n\
+                     VALUE \"CompanyName\", \"hackvshack.net\"\r\n\
+                     VALUE \"FileDescription\", \"Pure Rust Windows DLL injector (Manual Map, Hijack, APC, Syscalls) with automated WER crash diagnostics for x64 and WOW64. Zero dependencies.\"\r\n\
                      VALUE \"FileVersion\", \"{ver_str}\"\r\n\
-                     VALUE \"InternalName\", \"BlackBoxInjector\"\r\n\
+                     VALUE \"InternalName\", \"BlackBox\"\r\n\
                      VALUE \"OriginalFilename\", \"BlackBoxInjector.exe\"\r\n\
-                     VALUE \"ProductName\", \"BlackBox Injector\"\r\n\
+                     VALUE \"ProductName\", \"BlackBox\"\r\n\
                      VALUE \"ProductVersion\", \"{ver_str}\"\r\n\
                  END\r\n\
              END\r\n\

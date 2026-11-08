@@ -467,12 +467,15 @@ pub fn crash_events(process_name: &str, pid: u32, since_unix: u64) -> CrashRecor
                         let matches = (!wanted_name.is_empty() && hay.contains(&wanted_name))
                             || (pid != 0 && hay.contains(&pid_text));
                         if matches {
-                            if event_id == 1000 && strings.len() >= 6 {
-                                // Application Error strings: app, version, module, module version,
-                                // exception code, fault offset, process id, ...
+                            if event_id == 1000 && strings.len() >= 7 {
+                                // Application Error insertion strings (the provider name is the
+                                // source and is not part of this list):
+                                // [0] app version, [1] app timestamp, [2] module,
+                                // [3] module version, [4] module timestamp,
+                                // [5] exception code, [6] fault offset, [7] process id, ...
                                 out.faulting_module.get_or_insert_with(|| strings[2].clone());
-                                out.exception_code.get_or_insert_with(|| strings[4].clone());
-                                out.fault_offset.get_or_insert_with(|| strings[5].clone());
+                                out.exception_code.get_or_insert_with(|| strings[5].clone());
+                                out.fault_offset.get_or_insert_with(|| strings[6].clone());
                             }
                             out.lines.push(format!(
                                 "[{}] {} (event {}) {}",
