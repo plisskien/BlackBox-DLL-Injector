@@ -9,6 +9,7 @@ extern "system" {
     pub fn GetCurrentProcess() -> HANDLE;
     pub fn GetCurrentProcessId() -> u32;
     pub fn GetCurrentThreadId() -> u32;
+    pub fn GetSystemDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
     pub fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: BOOL, dwProcessId: u32) -> HANDLE;
     pub fn CloseHandle(hObject: HANDLE) -> BOOL;
     pub fn VirtualAllocEx(

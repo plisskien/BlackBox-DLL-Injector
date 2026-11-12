@@ -1,4 +1,4 @@
-﻿//! Hand-assembled stub builders (x86 + x64). Every builder returns raw machine code
+//! Hand-assembled stub builders (x86 + x64). Every builder returns raw machine code
 //! with absolute remote addresses baked in at build time.
 //!
 //! Stub conventions:
@@ -59,8 +59,7 @@ pub fn ldrload_stub_x64(fn_addr: usize, us_addr: usize, out_addr: usize) -> Vec<
 
 /// Generic x64 "call fn(a1, a2, a3)" stub. The callee's return value stays in RAX and
 /// becomes the thread exit code.
-pub fn call3_stub_x64(fn_addr: usize, a1: usize, a2: usize, a3: usize) -> Vec<u8> {
-    let mut v = Vec::new();
+pub fn call3_stub_x64(fn_addr: usize, a1: usize, a2: usize, a3: usize) -> Vec<u8> {    let mut v = Vec::new();
     v.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28 (shadow + align)
     v.extend_from_slice(&[0x48, 0xB9]);
     v = push64(v, a1 as u64); // mov rcx, a1
@@ -279,6 +278,47 @@ pub fn patch_done_rel32(stub: &mut [u8], stub_base: usize, done: usize, after_fl
 /// Patch the absolute done address in a built x86 hijack stub.
 pub fn patch_done_abs32(stub: &mut [u8], done: usize, done_at: usize) {
     stub[done_at..done_at + 4].copy_from_slice(&(done as u32).to_le_bytes());
+}
+
+/// x64 stub used to register a manually mapped module's TLS directory with the loader:
+/// `LdrLockLoaderLock(0, 0, &cookie); status = LdrpHandleTlsData(entry, 0);
+/// LdrUnlockLoaderLock(0, cookie); return status`. `cookie` is a remote 8-byte slot.
+pub fn tls_register_stub_x64(
+    lock: usize,
+    handle: usize,
+    unlock: usize,
+    entry: usize,
+    cookie: usize,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(96);
+    v.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38
+    v.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    v.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    v.extend_from_slice(&[0x49, 0xB8]);
+    v = push64(v, cookie as u64); // mov r8, &cookie
+    v.extend_from_slice(&[0x48, 0xB8]);
+    v = push64(v, lock as u64); // mov rax, LdrLockLoaderLock
+    v.extend_from_slice(&[0xFF, 0xD0]); // call rax
+
+    v.extend_from_slice(&[0x48, 0xB9]);
+    v = push64(v, entry as u64); // mov rcx, entry
+    v.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    v.extend_from_slice(&[0x48, 0xB8]);
+    v = push64(v, handle as u64); // mov rax, LdrpHandleTlsData
+    v.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    v.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax
+
+    v.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    v.extend_from_slice(&[0x48, 0xBA]);
+    v = push64(v, cookie as u64); // mov rdx, &cookie
+    v.extend_from_slice(&[0x48, 0x8B, 0x12]); // mov rdx, [rdx]
+    v.extend_from_slice(&[0x48, 0xB8]);
+    v = push64(v, unlock as u64); // mov rax, LdrUnlockLoaderLock
+    v.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    v.extend_from_slice(&[0x4C, 0x89, 0xE0]); // mov rax, r12
+    v.extend_from_slice(&[0x48, 0x83, 0xC4, 0x38]); // add rsp, 0x38
+    v.push(0xC3); // ret
+    v
 }
 
 /// NOP variants for ModifyAssemblyCode (safe: only padding runs are rewritten).

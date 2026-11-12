@@ -1071,8 +1071,19 @@ fn inject(settings: &Settings, cmd: &Command) -> i32 {
         }
     }
 
+    // A dead target or a missing symbol cache is a user/environment problem, not an injector
+    // defect: print the error, but do not write a failure report.
+    if result.target_gone {
+        out("[!] The target process is not running - start it again, select it and retry. No failure report was written.");
+    } else if result.user_error {
+        out("[!] Environment error (ntdll symbols unavailable) - no failure report was written.");
+    }
+
     // Keep a full report for crashes and failed runs
-    if result.crash.is_some() || !result.failed.is_empty() {
+    if (result.crash.is_some() || !result.failed.is_empty())
+        && !result.target_gone
+        && !result.user_error
+    {
         let arch = crate::process::process_arch_quick(pid)
             .map(diag::arch_name)
             .unwrap_or("unknown");

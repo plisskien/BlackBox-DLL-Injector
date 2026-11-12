@@ -32,6 +32,12 @@ pub struct QueueResult {
     pub verifications: Vec<diag::Verification>,
     /// Set when the target died during the run
     pub crash: Option<diag::CrashInfo>,
+    /// The target process was not running when injection was attempted. This is the user's
+    /// process choice, not an injection bug, so callers show it without a failure report.
+    pub target_gone: bool,
+    /// The failure is an environment/user issue (target gone, or the ntdll symbols needed for
+    /// static TLS are neither cached nor downloadable) rather than an injector defect.
+    pub user_error: bool,
 }
 
 fn crash_info(exit_code: u32, after_ms: u64, target_name: &str, pid: u32) -> diag::CrashInfo {
@@ -141,6 +147,8 @@ pub fn run(pid: u32, modules: &[Module], opts: &QueueOptions, log: Logger) -> Qu
                     format!("target process already exited before injection ({})", diag::exit_text(code)),
                 ));
             }
+            result.target_gone = true;
+            result.user_error = true;
             result.aborted = true;
             return result;
         }
@@ -246,6 +254,19 @@ pub fn run(pid: u32, modules: &[Module], opts: &QueueOptions, log: Logger) -> Qu
                     break;
                 }
                 Err(e) => {
+                    // A missing target is the user's process choice, not an injector defect.
+                    // The same applies when static TLS cannot find/download its ntdll PDB:
+                    // that is an environment error, not a crash report to file.
+                    let target_gone = e.starts_with("OpenProcess(")
+                        && (e.contains("0x00000057")
+                            || watched.as_ref().map(|w| !w.alive()).unwrap_or(false));
+                    if target_gone {
+                        result.target_gone = true;
+                        result.user_error = true;
+                    }
+                    if e.starts_with("TLS-PDB-01") {
+                        result.user_error = true;
+                    }
                     if attempt < opts.retries {
                         attempt += 1;
                         log(&format!("[*] Retrying {} ({}/{}): {}", m.file_name(), attempt, opts.retries, e));

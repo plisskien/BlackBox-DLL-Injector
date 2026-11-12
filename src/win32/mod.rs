@@ -5,6 +5,7 @@
 #![allow(non_snake_case, non_camel_case_types, dead_code, clippy::missing_safety_doc)]
 
 pub mod advapi32;
+pub mod dbghelp;
 pub mod dwmapi;
 pub mod gdi32;
 pub mod kernel32;

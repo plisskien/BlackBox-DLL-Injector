@@ -415,7 +415,10 @@ pub struct Shared {
 struct InjectDone {
     ok: bool,
     crashed: bool,
+    target_gone: bool,
+    user_error: bool,
     message: String,
+    backend_error: String,
     report_body: Option<String>,
     report_path: Option<String>,
 }
@@ -3488,7 +3491,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let payload = if !ptr.is_null() {
                 *Box::from_raw(ptr)
             } else {
-                InjectDone { ok: wp != 0, crashed: false, message: String::new(), report_body: None, report_path: None }
+                InjectDone { ok: wp != 0, crashed: false, target_gone: false, user_error: false, message: String::new(), backend_error: String::new(), report_body: None, report_path: None }
             };
             if let Some(path) = &payload.report_path {
                 let kind = if payload.crashed { "Crash" } else { "Failure" };
@@ -3501,6 +3504,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 } else {
                     show_message(hwnd, scale, MsgKind::Error, "Target crashed", &payload.message, "", "E2002 TARGET_CRASHED", run_context(app));
                 }
+            } else if payload.target_gone {
+                push_log(app, &format!("[!] {}", payload.message));
+                let mut details = run_context(app);
+                if !payload.backend_error.is_empty() {
+                    details.push(format!("Backend message: {}", payload.backend_error));
+                }
+                show_message(hwnd, scale, MsgKind::Error, "Target not running", &payload.message, "The selected process exited before the DLL could be injected. Start it again and retry.", "E2003 TARGET_NOT_RUNNING", details);
+            } else if payload.user_error {
+                push_log(app, &format!("[!] {}", payload.message));
+                let mut details = run_context(app);
+                if !payload.backend_error.is_empty() {
+                    details.push(format!("Backend message: {}", payload.backend_error));
+                }
+                show_message(hwnd, scale, MsgKind::Error, "Symbols unavailable", &payload.message, "Connect to the internet and retry. The PDB is downloaded once and cached for later injections.", "TLS-PDB-01", details);
             } else if payload.ok {
                 if app.settings.close_on_inject {
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -4297,14 +4314,23 @@ unsafe fn on_inject_click(hwnd: HWND, app: &mut App) {
         };
         let crashed = result.crash.is_some();
         let failed = !result.failed.is_empty();
-        // Keep a full report for crashes and failures; a clean run does not need one
-        let report_out = if crashed || failed { crate::diag::write_report(&report) } else { None };
+        // A dead target or a missing ntdll symbol cache is a user/environment problem, not an
+        // injector defect. Show the existing error dialog, but do not write a failure report.
+        let report_out = if (crashed || failed) && !result.target_gone && !result.user_error {
+            crate::diag::write_report(&report)
+        } else {
+            None
+        };
         let ok = !failed && !crashed;
         let res_msg = if crashed {
             format!(
                 "The target crashed ({}) after the injection. Full details are in the report.",
                 crate::diag::exit_text(result.crash.as_ref().map(|c| c.exit_code).unwrap_or(0))
             )
+        } else if result.target_gone {
+            "The target process is not running. Start it again, select it, and retry.".to_string()
+        } else if result.user_error {
+            "Static TLS needs the ntdll symbol file for this Windows build, but it is not cached and could not be downloaded.".to_string()
         } else if ok {
             let verified = result.verifications.iter().filter(|v| v.listed).count();
             if verified == result.injected {
@@ -4323,7 +4349,14 @@ unsafe fn on_inject_click(hwnd: HWND, app: &mut App) {
         let payload = InjectDone {
             ok,
             crashed,
+            target_gone: result.target_gone,
+            user_error: result.user_error,
             message: res_msg,
+            backend_error: result
+                .failed
+                .first()
+                .map(|(_, e)| e.clone())
+                .unwrap_or_default(),
             report_body: report_out.as_ref().map(|r| r.body.clone()),
             report_path: report_out.as_ref().map(|r| r.path.clone()),
         };
@@ -8176,10 +8209,13 @@ unsafe extern "system" fn msg_dlg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
                 gdi32::DrawTextW(mem_dc, title_ptr, -1, &mut rc_t, DT_LEFT_FLAG | DT_VCENTER_FLAG | DT_SINGLELINE_FLAG | DT_NOPREFIX_FLAG);
             }
 
-            // What happened, and what to do next, wrapped to the text column
+            // What happened, and what to do next, wrapped to the text column. Stop above the
+            // buttons so a long message can never paint over them.
             gdi32::SelectObject(mem_dc, font_body);
             gdi32::SetTextColor(mem_dc, C_TEXT_BODY);
-            let mut rc_x = RECT { left: text_x, top: pad + s(28, scale), right: rc.right - pad, bottom: rc.bottom };
+            let btn_top = GetPropW(hwnd, wstr("MsgBtnTop").as_ptr()) as usize as i32;
+            let body_bottom = (btn_top - s(10, scale)).max(pad + s(28, scale));
+            let mut rc_x = RECT { left: text_x, top: pad + s(28, scale), right: rc.right - pad, bottom: body_bottom };
             if !text_ptr.is_null() {
                 gdi32::DrawTextW(mem_dc, text_ptr, -1, &mut rc_x, DT_LEFT_FLAG | DT_WORDBREAK_FLAG | DT_NOPREFIX_FLAG);
             }

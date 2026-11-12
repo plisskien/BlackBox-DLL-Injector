@@ -4,7 +4,8 @@
 //! in one shot. Initialisation then follows the loader's order:
 //!   1. per-section protections are applied (code is never left writable while it runs)
 //!   2. x64 unwind data is registered so SEH / C++ exceptions survive
-//!   3. the TLS directory is materialised (index + per-thread block) and TLS callbacks run
+//!   3. the TLS directory is registered with the loader (real index + per-thread blocks) and
+//!      the TLS callbacks run
 //!   4. DllMain runs; a FALSE return is treated as a failed load
 //!
 //! All PE reads are bounds-checked: a malformed file must yield an error, never a panic.
@@ -406,15 +407,6 @@ fn setup_tls(
     if total > 0x0100_0000 {
         return Err(format!("TLS block of {total:#x} bytes is implausible"));
     }
-    let start_rva = dir.start_address.wrapping_sub(base as u64) as usize;
-    let mut template = Vec::new();
-    if raw_len > 0 {
-        if start_rva + raw_len > mapped.len() {
-            return Err("TLS template is outside the image".into());
-        }
-        template.extend_from_slice(&mapped[start_rva..start_rva + raw_len]);
-    }
-    let size = ((total + 15) & !15).max(16);
 
     // Callbacks (absolute VAs after relocation -> RVAs into `mapped`).
     let mut callbacks = Vec::new();
@@ -444,164 +436,40 @@ fn setup_tls(
         return Ok(None);
     }
 
-    // Preferred path (x64): let the loader own the index and the per-thread blocks. The base
-    // seed is a real MSVC-built DLL (`seed/tls_seed_base.dll`, embedded) with a 0x2000-byte
-    // static TLS template. For each payload a `.tlsp` section sized exactly to its template is
-    // appended, the TLS directory Start/End/ZeroFill are patched and the entry point is replaced
-    // with a `mov eax,1; ret` stub. The loader assigns a genuine `_tls_index` and fills a block of
-    // exactly the payload's size for every thread, including threads that already exist and every
-    // future one. That removes all manual thread-array surgery, which raced with the game's own
-    // thread churn. A synthetic PE does not work here (the loader ignores its TLS directory), which
-    // is why a real DLL is embedded.
+    // x64: register the mapped image's TLS directory with the loader directly. This opens no
+    // file and bypasses host image-load filters (CS2 Trusted Mode's NtOpenFile gate) entirely.
+    // The internal function is resolved from the matching ntdll PDB; if those symbols are
+    // unavailable, the injection fails with a clear error instead of trying a loader-visible
+    // seed or an unsafe per-thread array replacement.
     if arch == Arch::X64 {
-        match install_tls_seed(h, arch, &template, dir.size_of_zero_fill, log) {
-            Ok((idx, seed_base)) => {
-                if dir.address_of_index != 0 {
-                    remote_write(h, dir.address_of_index as usize, &idx.to_le_bytes())?;
-                }
-                log(&format!(
-                    "[*] TLS: index {idx} (loader-managed via seed module at {seed_base:#x}, {raw_len:#x} template + {:#x} zero-fill)",
-                    dir.size_of_zero_fill
-                ));
-                // Blocks are loader-owned for existing and future threads; no array surgery.
-                let t = RemoteTls {
-                    index: idx as usize,
-                    loader_managed: true,
-                    template: Vec::new(),
-                    size: 0,
-                    callbacks,
-                    expect_array: false,
-                    heap: 0,
-                    rtl_alloc: 0,
-                    terminate: 0,
-                };
-                for (i, cb) in t.callbacks.iter().enumerate() {
-                    log(&format!("[*] Running TLS callback {} @ {:#x}", i + 1, cb));
-                    call_remote(h, arch, *cb, base, 1, 0, Some(&t), hide_threads, log, unsafe_to_free)?;
-                }
-                return Ok(Some(t));
-            }
-            Err(e) => {
-                if arch == Arch::X64 {
-                    return Err(format!(
-                        "TLS seed module unavailable ({e}); refusing the unsafe manual TLS fallback on x64"
-                    ));
-                }
-                log(&format!(
-                    "[!] TLS seed module unavailable ({e}); falling back to manual TLS seeding"
-                ));
-            }
-        }
+        let idx = crate::inject::ldrtls::register(
+            h,
+            arch,
+            base,
+            pe.size_of_image,
+            dir.address_of_index as usize,
+            hide_threads,
+            log,
+            unsafe_to_free,
+        )?;
+        log(&format!(
+            "[*] TLS: index {idx} registered with the loader (no seed module)"
+        ));
+        return finish_loader_tls(
+            h,
+            arch,
+            base,
+            dir.address_of_index as usize,
+            idx,
+            callbacks,
+            hide_threads,
+            log,
+            unsafe_to_free,
+        )
+        .map(Some);
     }
 
-    // Pick a free *static* TLS index. The loader assigns one per module that has a TLS
-    // directory, and `__declspec(thread)` indexes its ThreadLocalStoragePointer array with
-    // it. The Win32 TlsAlloc slots are a different array and cannot be used here.
-    let pid = crate::process::pid_of(h)?;
-    let mods = remote_modules(h, arch)?;
-    // The index the loader would hand to the next TLS module is the number of loaded
-    // modules that already have one.
-    let counted = count_tls_modules(h, arch, &mods);
-    let mut threads: Vec<(u32, usize, usize)> = Vec::new(); // (tid, teb, array)
-    for tid in target_thread_ids(pid) {
-        if let Ok(teb) = thread_teb(h, tid, arch) {
-            threads.push((tid, teb, read_tls_array(h, arch, teb).unwrap_or(0)));
-        }
-    }
-    if threads.is_empty() {
-        return Err("cannot enumerate target threads for TLS setup".into());
-    }
-    // `count_tls_modules` mirrors the loader's own module-index assignment. As a safety net
-    // against an under-count, never pick an index that an existing thread's array already
-    // uses (read only up to the counted index - past the loader's array is heap garbage).
-    let observed = threads
-        .iter()
-        .filter(|(_, _, a)| *a != 0)
-        .map(|(_, _, a)| tls_array_used(h, arch, *a, counted.min(MAX_STATIC_TLS)))
-        .max()
-        .unwrap_or(0);
-    let index = counted.max(observed);
-    if index >= MAX_STATIC_TLS {
-        return Err(format!(
-            "static TLS index {index} exceeds the {MAX_STATIC_TLS}-slot limit"
-        ));
-    }
-    let array_entries = index + 1;
-    let expect_array = threads.iter().any(|(_, _, a)| *a != 0);
-    if dir.address_of_index != 0 {
-        remote_write(h, dir.address_of_index as usize, &(index as u32).to_le_bytes())?;
-    }
-    // The TLS array is owned by the loader and freed with the thread, so replacements have
-    // to come from the target's own heap (RtlAllocateHeap), never from VirtualAllocEx.
-    let kernel = find_module(&mods, "kernel32.dll").ok_or("kernel32.dll not found in target")?;
-    let get_heap = remote_export(h, arch, kernel.base, "GetProcessHeap", 0)?;
-    let heap = call_remote_ptr(h, arch, get_heap, 0, 0, 0, log)?;
-    if heap == 0 {
-        return Err("GetProcessHeap failed in the target".into());
-    }
-    let ntdll_mod = find_module(&mods, "ntdll.dll").ok_or("ntdll.dll not found in target")?;
-    let rtl_alloc = remote_export(h, arch, ntdll_mod.base, "RtlAllocateHeap", 0)?;
-    let terminate = remote_export(h, arch, kernel.base, "TerminateThread", 0)?;
-    let array_size = array_entries * std::mem::size_of::<usize>();
-    let mut threaded = 0usize;
-    // Seed every live thread; retry transient failures once, then fail the injection instead of
-    // leaving a thread without the slot (the payload would corrupt memory on that thread).
-    let mut done: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut failures: Vec<(u32, String)> = Vec::new();
-    for pass in 0..2 {
-        failures.clear();
-        for (tid, teb, _) in &threads {
-            if done.contains(tid) {
-                continue;
-            }
-            let outcome = (|| -> Result<(), String> {
-                let block = alloc_tls_block(h, arch, heap, rtl_alloc, &template, size, log)?;
-                let array = call_remote_ptr(h, arch, rtl_alloc, heap, 0, array_size, log)?;
-                if array == 0 {
-                    return Err("RtlAllocateHeap returned 0 for a TLS array".into());
-                }
-                set_static_tls_slot(h, arch, *teb, index, block, array, array_entries)
-            })();
-            match outcome {
-                Ok(()) => {
-                    done.insert(*tid);
-                    threaded += 1;
-                }
-                Err(e) => failures.push((*tid, e)),
-            }
-        }
-        if failures.is_empty() {
-            break;
-        }
-        if pass == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-    if !failures.is_empty() {
-        let sample: Vec<String> = failures
-            .iter()
-            .take(3)
-            .map(|(t, e)| format!("tid {t}: {e}"))
-            .collect();
-        return Err(format!(
-            "could not initialise static TLS for {}/{} target threads ({})",
-            failures.len(),
-            threads.len(),
-            sample.join("; ")
-        ));
-    }
-    log(&format!(
-        "[*] TLS: index {index}, {raw_len:#x} template bytes + {:#x} zero-fill, {} thread block(s)",
-        dir.size_of_zero_fill, threaded
-    ));
-
-    // Run the TLS callbacks before DllMain, like the loader.
-    let tls = RemoteTls { index, loader_managed: false, template, size, callbacks, expect_array, heap, rtl_alloc, terminate };
-    for (i, cb) in tls.callbacks.iter().enumerate() {
-        log(&format!("[*] Running TLS callback {} @ {:#x}", i + 1, cb));
-        call_remote(h, arch, *cb, base, 1, 0, Some(&tls), hide_threads, log, unsafe_to_free)?;
-    }
-    Ok(Some(tls))
+    Err("static TLS registration is only available for x64 targets".into())
 }
 
 fn alloc_tls_block(
@@ -623,291 +491,42 @@ fn alloc_tls_block(
     }
     Ok(p)
 }
-// ===== loader-managed static TLS via a dynamically sized real seed DLL =====
-//
-// A synthetic PE does not work: the loader accepts the module but never writes its
-// `_tls_index` nor copies its template into per-thread blocks (verified with a probe). A real
-// MSVC-built DLL does get both. So the injector takes a real base DLL and appends a `.tlsp`
-// section sized exactly to the payload's TLS template, patches the TLS directory Start/End/
-// ZeroFill and the entry point to a `mov eax,1; ret` stub (the base CRT never runs and there are
-// no TLS callbacks). The loader then assigns a genuine index and allocates exactly the payload's
-// block for existing and future threads. There is no template capacity limit; the only bounds are
-// disk space for the temporary seed and the loader's own TLS allocation.
-
-const TLS_SEED_BASE: &[u8] = include_bytes!("../../seed/tls_seed_base.dll");
-
-fn seed_align(v: usize, a: usize) -> usize {
-    (v + a - 1) & !(a - 1)
-}
-fn seed_put_u16(d: &mut [u8], o: usize, v: usize) {
-    d[o..o + 2].copy_from_slice(&(v as u16).to_le_bytes());
-}
-fn seed_put_u32(d: &mut [u8], o: usize, v: usize) {
-    d[o..o + 4].copy_from_slice(&(v as u32).to_le_bytes());
-}
-fn seed_put_u64(d: &mut [u8], o: usize, v: u64) {
-    d[o..o + 8].copy_from_slice(&v.to_le_bytes());
-}
-
-fn seed_u16(d: &[u8], o: usize) -> usize {
-    u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as usize
-}
-fn seed_u32(d: &[u8], o: usize) -> usize {
-    u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) as usize
-}
-fn seed_u64(d: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
-}
-
-fn pe_rva_to_off(data: &[u8], rva: usize) -> Option<usize> {
-    let pe = seed_u32(data, 0x3C);
-    if pe + 0x18 > data.len() {
-        return None;
-    }
-    let opt = pe + 24;
-    let opt_size = seed_u16(data, pe + 20);
-    let num = seed_u16(data, pe + 6);
-    let sec = opt + opt_size;
-    for i in 0..num {
-        let s = sec + i * 40;
-        if s + 40 > data.len() {
-            return None;
-        }
-        let vsize = seed_u32(data, s + 8);
-        let va = seed_u32(data, s + 12);
-        let raw_size = seed_u32(data, s + 16);
-        let raw_ptr = seed_u32(data, s + 20);
-        if rva >= va && rva < va + vsize.max(raw_size) {
-            let d = rva - va;
-            if d >= raw_size {
-                return None;
-            }
-            return Some(raw_ptr + d);
-        }
-    }
-    None
-}
-
-/// Append a `.tlsp` section that holds exactly this payload's TLS template and a `mov eax,1; ret`
-/// entry stub, then point the base seed's TLS directory at it. The base image is a real, working
-/// DLL, so the loader processes the TLS directory and fills blocks for every thread.
-fn build_dynamic_seed(template: &[u8], zero_fill: u32) -> Result<Vec<u8>, String> {
-    let base = TLS_SEED_BASE;
-    if base.len() < 0x200 || &base[0..2] != b"MZ" {
-        return Err("embedded TLS base seed is not a PE file".into());
-    }
-    let pe = seed_u32(base, 0x3C);
-    let opt = pe + 24;
-    if seed_u16(base, opt) != 0x20B {
-        return Err("embedded TLS base seed is not PE32+".into());
-    }
-    let nsec = seed_u16(base, pe + 6);
-    let opt_size = seed_u16(base, pe + 20);
-    let sec_table = opt + opt_size;
-    let image_base = seed_u64(base, opt + 24);
-    let size_image = seed_u32(base, opt + 56);
-    let sec_align = seed_u32(base, opt + 32);
-    let file_align = seed_u32(base, opt + 36).max(0x200);
-    let size_headers = seed_u32(base, opt + 60);
-    let dd = opt + 112;
-    let tls_rva = seed_u32(base, dd + 9 * 8);
-    if tls_rva == 0 {
-        return Err("embedded TLS base seed has no TLS directory".into());
-    }
-    let tls_off = pe_rva_to_off(base, tls_rva).ok_or("TLS directory RVA is unmapped")?;
-    if tls_off + 0x28 > base.len() {
-        return Err("TLS directory is truncated".into());
-    }
-    let new_sec = sec_table + nsec * 40;
-    if new_sec + 40 > size_headers.max(base.len()) {
-        return Err("no room for another section header in the seed headers".into());
-    }
-
-    let stub: [u8; 6] = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]; // mov eax,1; ret
-    let stub_off = seed_align(template.len(), 16);
-    let vsize = stub_off + stub.len();
-    let raw_size = seed_align(vsize, file_align);
-    let new_va = seed_align(size_image, sec_align);
-    let new_image_size = seed_align(new_va + vsize, sec_align);
-
-    let mut d = base.to_vec();
-    seed_put_u64(&mut d, tls_off, image_base + new_va as u64);
-    seed_put_u64(&mut d, tls_off + 8, image_base + (new_va + template.len()) as u64);
-    seed_put_u64(&mut d, tls_off + 24, 0); // no TLS callbacks: the base CRT must not run
-    seed_put_u32(&mut d, tls_off + 32, zero_fill as usize);
-    seed_put_u32(&mut d, opt + 16, new_va + stub_off);
-    seed_put_u32(&mut d, opt + 56, new_image_size);
-
-    let raw_ptr = seed_align(d.len(), file_align);
-    d[new_sec..new_sec + 8].copy_from_slice(b".tlsp\0\0\0");
-    seed_put_u32(&mut d, new_sec + 8, vsize);
-    seed_put_u32(&mut d, new_sec + 12, new_va);
-    seed_put_u32(&mut d, new_sec + 16, raw_size);
-    seed_put_u32(&mut d, new_sec + 20, raw_ptr);
-    seed_put_u32(&mut d, new_sec + 36, 0xE000_0040); // RWX data
-    seed_put_u16(&mut d, pe + 6, nsec + 1);
-
-    d.resize(raw_ptr, 0);
-    let mut raw = vec![0u8; raw_size];
-    raw[..template.len()].copy_from_slice(template);
-    raw[stub_off..stub_off + stub.len()].copy_from_slice(&stub);
-    d.extend_from_slice(&raw);
-    Ok(d)
-}
-
-/// Patch the embedded seed with the payload's TLS template, load it in the target and return
-/// (loader-assigned `_tls_index`, module base).
-fn install_tls_seed(
+/// Publish the loader-assigned index into the payload's `AddressOfIndex` and run its TLS
+/// callbacks with `DLL_PROCESS_ATTACH`, exactly where the loader would for a normal module.
+fn finish_loader_tls(
     h: HANDLE,
     arch: Arch,
-    template: &[u8],
-    zero_fill: u32,
+    base: usize,
+    address_of_index: usize,
+    index: u32,
+    callbacks: Vec<usize>,
+    hide_threads: bool,
     log: Logger,
-) -> Result<(u32, usize), String> {
-    if arch != Arch::X64 {
-        return Err("only x64 has a loader-managed seed".into());
-    }
-    let bytes = build_dynamic_seed(template, zero_fill)?;
-    log(&format!(
-        "[*] TLS seed: dynamic {:x} byte block ({} byte template + {zero_fill} zero-fill)",
-        template.len() + zero_fill as usize,
-        template.len()
-    ));
-    let mods = remote_modules(h, arch)?;
-    let kernel = find_module(&mods, "kernel32.dll").ok_or("kernel32.dll not found in target")?;
-    let loadlib = remote_export(h, arch, kernel.base, "LoadLibraryW", 0)?;
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let file = format!("bb_tlsseed_{}_{}.dll", std::process::id(), unique);
-    let mut wrote: Option<std::path::PathBuf> = None;
-    let mut errs: Vec<String> = Vec::new();
-    let mut dirs: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        dirs.push(std::path::PathBuf::from(local).join("BlackBoxInjector"));
-    }
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    {
-        dirs.push(exe_dir);
-    }
-    for dir in dirs {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            errs.push(format!("mkdir {}: {e}", dir.display()));
-        }
-        let candidate = dir.join(&file);
-        match std::fs::write(&candidate, &bytes) {
-            Ok(()) => {
-                wrote = Some(candidate);
-                break;
-            }
-            Err(e) => errs.push(format!("{}: {e}", candidate.display())),
+    unsafe_to_free: &mut bool,
+) -> Result<RemoteTls, String> {
+    if address_of_index != 0 {
+        if let Err(e) = remote_write(h, address_of_index, &index.to_le_bytes()) {
+            // The loader already owns the TLS entry; the payload must stay mapped.
+            *unsafe_to_free = true;
+            return Err(format!("cannot publish TLS index {index:#x}: {e}"));
         }
     }
-    let path = wrote
-        .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| format!("cannot write TLS seed ({})", errs.join("; ")))?;
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let wpath = wstr(&path);
-    let addr = remote_alloc(h, wpath.len() * 2, PAGE_READWRITE)?;
-    remote_write(h, addr, &path_as_bytes(&wpath))?;
-    let load = (|| -> Result<(), String> {
-        let th = create_remote_thread(h, arch, loadlib, addr, false)?;
-        let st = wait_thread_status(th, 15_000);
-        let _ = close_handle(th);
-        match st {
-            ThreadWait::Done(_) => Ok(()),
-            ThreadWait::TimedOut => Err("LoadLibraryW(TLS seed) timed out".into()),
-            ThreadWait::Failed(e) => Err(e),
-        }
-    })();
-    let _ = remote_free(h, addr);
-    let _ = std::fs::remove_file(&path);
-    load?;
-    let fresh = remote_modules(h, arch)?;
-    let m = find_module(&fresh, &name)
-        .cloned()
-        .ok_or("TLS seed did not appear in the module list")?;
-    let index = (|| -> Result<u32, String> {
-        let dos = remote_read(h, m.base, 0x40)?;
-        let pe = u32::from_le_bytes(dos[0x3C..0x40].try_into().unwrap()) as usize;
-        let nt = remote_read(h, m.base + pe, 0x18 + 0xF0)?;
-        let dd = 0x18 + 112;
-        let tls_rva = u32::from_le_bytes(nt[dd + 9 * 8..dd + 9 * 8 + 4].try_into().unwrap()) as usize;
-        if tls_rva == 0 {
-            return Err("seed has no TLS directory in the target".into());
-        }
-        let td = remote_read(h, m.base + tls_rva, 0x28)?;
-        let aoi = u64::from_le_bytes(td[0x10..0x18].try_into().unwrap()) as usize;
-        if aoi == 0 {
-            return Err("seed AddressOfIndex is null".into());
-        }
-        remote_read_u32(h, aoi)
-    })();
-    match index {
-        Ok(v) if (v as usize) < MAX_STATIC_TLS => {
-            log(&format!("[+] Loaded TLS seed {} @ {:#x} (index {v})", name, m.base));
-            Ok((v, m.base))
-        }
-        Ok(v) => Err(format!("seed TLS index {v} is out of range")),
-        Err(e) => Err(format!("seed TLS index unreadable: {e}")),
+    let t = RemoteTls {
+        index: index as usize,
+        loader_managed: true,
+        template: Vec::new(),
+        size: 0,
+        callbacks,
+        expect_array: false,
+        heap: 0,
+        rtl_alloc: 0,
+        terminate: 0,
+    };
+    for (i, cb) in t.callbacks.iter().enumerate() {
+        log(&format!("[*] Running TLS callback {} @ {:#x}", i + 1, cb));
+        call_remote(h, arch, *cb, base, 1, 0, Some(&t), hide_threads, log, unsafe_to_free)?;
     }
-}
-
-/// The index the loader would hand to the next TLS module: `max(_tls_index) + 1`, read from
-/// each loaded module's own TLS directory (`AddressOfIndex`). Counting modules that merely have
-/// a TLS directory can lag the loader (a directory may exist before its index is assigned, or an
-/// index may be assigned before the module is visible in the PEB), which would pick a slot
-/// already owned by another module and corrupt that module's thread-local data.
-fn count_tls_modules(h: HANDLE, arch: Arch, mods: &[RemoteModule]) -> usize {
-    let pe32 = arch == Arch::X86;
-    let mut max_index: Option<usize> = None;
-    for m in mods {
-        let idx = (|| -> Result<Option<usize>, String> {
-            let dos = remote_read(h, m.base, 0x40)?;
-            if dos[0] != b'M' || dos[1] != b'Z' {
-                return Ok(None);
-            }
-            let pe_off = u32::from_le_bytes(dos[0x3C..0x40].try_into().unwrap()) as usize;
-            let nt = remote_read(h, m.base + pe_off, 0x18 + if pe32 { 0xE0 } else { 0xF0 })?;
-            let data_dir_off = 0x18 + if pe32 { 96 } else { 112 };
-            let tls_rva = u32::from_le_bytes(
-                nt[data_dir_off + 9 * 8..data_dir_off + 9 * 8 + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            if tls_rva == 0 {
-                return Ok(None);
-            }
-            // IMAGE_TLS_DIRECTORY: AddressOfIndex at +0x0C (PE32) / +0x10 (PE32+).
-            let td = remote_read(h, m.base + tls_rva, 0x28)?;
-            let aoi = if pe32 {
-                u32::from_le_bytes(td[0x0C..0x10].try_into().unwrap()) as usize
-            } else {
-                u64::from_le_bytes(td[0x10..0x18].try_into().unwrap()) as usize
-            };
-            if aoi == 0 {
-                return Ok(None);
-            }
-            let v = if pe32 {
-                remote_read_u32(h, aoi)? as usize
-            } else {
-                remote_read_u64(h, aoi)? as usize
-            };
-            // Ignore implausible values (uninitialised index storage) rather than failing the map.
-            Ok(if v < MAX_STATIC_TLS { Some(v) } else { None })
-        })()
-        .unwrap_or(None);
-        if let Some(v) = idx {
-            max_index = Some(max_index.map_or(v, |m| m.max(v)));
-        }
-    }
-    max_index.map(|v| v + 1).unwrap_or(0)
+    Ok(t)
 }
 
 /// Run a call in a remote thread and return the full-width pointer result. The thread exit
@@ -1075,31 +694,6 @@ fn call_remote(
         log("[!] Leaving a call stub allocated (its thread did not finish)");
     }
     r
-}
-
-/// Thread ids of a process (Toolhelp snapshot).
-fn target_thread_ids(pid: u32) -> Vec<u32> {
-    let mut out = Vec::new();
-    unsafe {
-        let snap = kernel32::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return out;
-        }
-        let mut te = THREADENTRY32::default();
-        te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-        if kernel32::Thread32First(snap, &mut te) != 0 {
-            loop {
-                if te.th32OwnerProcessID == pid {
-                    out.push(te.th32ThreadID);
-                }
-                if kernel32::Thread32Next(snap, &mut te) == 0 {
-                    break;
-                }
-            }
-        }
-        let _ = kernel32::CloseHandle(snap);
-    }
-    out
 }
 
 /// Populate IAT entries in the locally-mapped image.

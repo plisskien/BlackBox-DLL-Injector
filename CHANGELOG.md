@@ -4,6 +4,36 @@ All notable changes to BlackBox Injector are recorded here. The project follows 
 versioning: MAJOR.MINOR.PATCH, where PATCH releases contain backwards-compatible fixes, MINOR
 releases add backwards-compatible features, and MAJOR releases contain breaking changes.
 
+## [1.0.2]
+
+### Added
+
+- Manual-map static TLS on x64 can register the mapped image directly with the loader. The
+  injector builds a synthetic `LDR_DATA_TABLE_ENTRY`, takes the loader lock and calls the internal
+  `LdrpHandleTlsData`. The loader assigns a real index, inserts an `LDRP_TLS_ENTRY` into
+  `LdrpTlsList`, writes `AddressOfIndex`, and initializes blocks for existing threads through
+  `NtSetInformationProcess(ProcessTlsInformation)`; future threads allocate a block through
+  `LdrpInitializeThread` / `LdrpAllocateTls`. No image file is opened and no `LoadLibraryW` /
+  `LdrLoadDll` call is made, so image-load filters such as CS2 Trusted Mode's `NtOpenFile` hook
+  are not invoked. `LdrpHandleTlsData` is resolved by name from the matching ntdll PDB, downloaded
+  once from the Microsoft symbol server and cached in `%TEMP%\BlackBoxInjector\symbols`
+  (`LOCALAPPDATA` and the injector directory are fallbacks), so it is not tied to one Windows
+  build. If the PDB is neither cached nor downloadable, the injection fails with `TLS-PDB-01`
+  through the normal failure dialog; no seed fallback is attempted.
+
+### Changed
+
+- Removed the loader-visible TLS seed. Static TLS now has one path: the loader-registration call
+  resolved from the ntdll PDB. A missing symbol cache and failed Microsoft symbol download produce
+  a normal injection error instead of silently trying an unsigned seed.
+- The synthetic LDR entry is not added to the PEB module list, so the payload remains unlisted.
+  The trade-off is that the loader's thread-init loop does not deliver the payload's
+  `DLL_THREAD_ATTACH` / `DLL_THREAD_DETACH` callbacks (or `DllMain` thread attach) for future
+  threads; the TLS data block itself is allocated and valid for existing and new threads.
+- A target that is no longer running reports `E2003 TARGET_NOT_RUNNING` in the normal error
+  dialog, and a missing/undownloadable ntdll PDB reports `TLS-PDB-01`; neither writes a failure
+  report. These are user/environment errors, not injector bugs.
+
 ## [1.0.1]
 
 ### Fixed

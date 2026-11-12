@@ -1,9 +1,10 @@
-﻿//! Injection engine - supported injection techniques:
+//! Injection engine - supported injection techniques:
 //! 0 Standard, 1 LdrLoadDll, 2 Manual Map, 3 Thread Hijack, 4 NtCreateThreadEx.
 
 pub mod apc;
 pub mod hijack;
 pub mod ldrload;
+pub mod ldrtls;
 pub mod manual_map;
 pub mod ntthread;
 pub mod shellcode;

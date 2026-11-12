@@ -1,6 +1,6 @@
 [package]
 name = "blackbox-injector"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "BlackBox Injector - native Win32 DLL injector"
 build = "build.rs"
