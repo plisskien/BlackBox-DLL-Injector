@@ -4,6 +4,24 @@ All notable changes to BlackBox Injector are recorded here. The project follows 
 versioning: MAJOR.MINOR.PATCH, where PATCH releases contain backwards-compatible fixes, MINOR
 releases add backwards-compatible features, and MAJOR releases contain breaking changes.
 
+## [1.0.3]
+
+### Fixed
+
+- Drag-and-drop works in the elevated build on Windows 10 and 11. The main window now allows
+  `WM_DROPFILES` and its `WM_COPYGLOBALDATA` payload through UIPI, and logs a clear error if the
+  message filter cannot be installed.
+- **Open File Location** selects the DLL in Explorer instead of opening Explorer's default
+  folder. The `/select,"..."` argument is passed with `CommandExt::raw_arg`, so Explorer's own
+  parser receives it verbatim instead of Rust's escaped `Command` form.
+- Target cards and process-picker rows no longer show the BlackBox logo, Windows' generic `.exe`
+  icon, or a stale icon when no icon is available. Process icons are read only from a live
+  process image, and the target icon is cleared when the process exits.
+- A burst of manual-map progress lines no longer makes the UI lag. Log messages are coalesced into
+  one repaint per burst, and only the visible log lines are wrapped and measured instead of the
+  newest 400 lines on every paint.
+- Failed `WM_APP_LOG` posts no longer leak their queued string.
+
 ## [1.0.2]
 
 ### Added

@@ -62,7 +62,7 @@ const THREAD_URL: &str = crate::update::THREAD_URL;
 const GITHUB_URL: &str = crate::update::GITHUB_URL;
 const DEV_URL: &str = crate::update::DEV_URL;
 
-// Embedded application icon (window/taskbar icon and the target-card logo)
+// Embedded application icon (window and taskbar icon)
 const LOGO_ICO: &[u8] = include_bytes!("../assets/blackbox.ico");
 
 // Base Window Dimensions at 100% scale
@@ -207,14 +207,6 @@ extern "system" {
         lpExeName: *mut u16,
         lpdwSize: *mut u32,
     ) -> BOOL;
-    fn SearchPathW(
-        lpPath: *const u16,
-        lpFileName: *const u16,
-        lpExtension: *const u16,
-        nBufferLength: u32,
-        lpBuffer: *mut u16,
-        lpFilePart: *mut *mut u16,
-    ) -> u32;
 }
 
 #[repr(C)]
@@ -2192,9 +2184,6 @@ unsafe fn draw_owner_button(dis: &DRAWITEMSTRUCT, scale: u32) {
     }
 }
 
-static LOGO_HICON: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
 /// Writes the embedded .ico to a temp file (LoadImage wants a path) and returns it.
 unsafe fn icon_file() -> Option<std::path::PathBuf> {
     let mut buf = [0u16; MAX_PATH];
@@ -2235,24 +2224,6 @@ unsafe fn apply_app_icons(hwnd: HWND) {
     }
 }
 
-unsafe fn logo_icon() -> HICON {
-    use std::sync::atomic::Ordering;
-    let cached = LOGO_HICON.load(Ordering::Relaxed);
-    if !cached.is_null() {
-        return cached;
-    }
-    let icon = load_embedded_icon(128);
-    LOGO_HICON.store(icon, Ordering::Relaxed);
-    icon
-}
-
-unsafe fn draw_syringe_logo(hdc: HDC, x: i32, y: i32, w: i32, h: i32) {
-    let icon = logo_icon();
-    if icon.is_null() {
-        return;
-    }
-    DrawIconEx(hdc, x, y, icon, w, h, 0, NULL_HANDLE, 0x0003 /* DI_NORMAL */);
-}
 // Find Window Title for PID
 unsafe fn find_main_window_title(pid: u32) -> String {
     unsafe extern "system" fn enum_proc(hwnd: HWND, lp: LPARAM) -> BOOL {
@@ -2300,18 +2271,20 @@ unsafe fn get_windowed_pids() -> std::collections::HashSet<u32> {
     set
 }
 
-// Dynamic Process Icon Extractor using Windows Shell SHGetFileInfoW
-unsafe fn fetch_process_icon(pid: u32, proc_name: &str) -> Option<HICON> {
-    fetch_process_icon_sized(pid, proc_name, false)
+// Dynamic process icon extractor. It only ever reads the image path of a live process.
+// Looking an icon up by name (SearchPathW or SHGetFileInfoW with SHGFI_USEFILEATTRIBUTES)
+// invents a generic .exe icon when nothing matches, which made an unmatched target look selected.
+unsafe fn fetch_process_icon(pid: u32) -> Option<HICON> {
+    fetch_process_icon_sized(pid, false)
 }
 
-unsafe fn fetch_process_icon_sized(pid: u32, proc_name: &str, small: bool) -> Option<HICON> {
-    fetch_icon_with_alternates(pid, proc_name, small, &[])
+unsafe fn fetch_process_icon_sized(pid: u32, small: bool) -> Option<HICON> {
+    fetch_icon_with_alternates(pid, small, &[])
 }
 
 // `alternates` are other pids running the same executable, tried if `pid` can't be opened.
 // Callers that already hold a process list pass it in, so no fresh snapshot is taken per icon.
-unsafe fn fetch_icon_with_alternates(pid: u32, proc_name: &str, small: bool, alternates: &[u32]) -> Option<HICON> {
+unsafe fn fetch_icon_with_alternates(pid: u32, small: bool, alternates: &[u32]) -> Option<HICON> {
     let mut exe_path: Option<Vec<u16>> = None;
 
     // 1. If PID > 0, query image path from process handle
@@ -2357,49 +2330,17 @@ unsafe fn fetch_icon_with_alternates(pid: u32, proc_name: &str, small: bool, alt
         }
     }
 
-    // 3. Fallback: SearchPathW
-    if exe_path.is_none() && !proc_name.is_empty() {
-        let name_clean = if proc_name.ends_with(".exe") { proc_name.to_string() } else { format!("{}.exe", proc_name) };
-        let mut buf = [0u16; 1024];
-        let mut file_part = std::ptr::null_mut();
-        let ext = wstr(".exe");
-        let name_w = wstr(&name_clean);
-        let len = SearchPathW(std::ptr::null(), name_w.as_ptr(), ext.as_ptr(), 1024, buf.as_mut_ptr(), &mut file_part);
-        if len > 0 {
-            let mut path_vec = Vec::with_capacity((len + 1) as usize);
-            path_vec.extend_from_slice(&buf[..len as usize]);
-            path_vec.push(0);
-            exe_path = Some(path_vec);
-        }
-    }
-
+    // 3. Extract the icon from that real executable. If this fails there is no icon to show;
+    // do not substitute Windows' generic icon.
+    let path_w = exe_path?;
     let icon_flags = 0x100 /* SHGFI_ICON */ | if small { 0x0001 /* SHGFI_SMALLICON */ } else { 0x0000 /* SHGFI_LARGEICON */ };
-
-    // 4. Extract icon via SHGetFileInfoW
-    if let Some(path_w) = exe_path {
-        let mut shfi: SHFILEINFOW = std::mem::zeroed();
-        let res = SHGetFileInfoW(path_w.as_ptr(), 0, &mut shfi, std::mem::size_of::<SHFILEINFOW>() as u32, icon_flags);
-        if res != 0 && !shfi.hIcon.is_null() {
-            return Some(shfi.hIcon);
-        }
-        let res2 = SHGetFileInfoW(path_w.as_ptr(), 0x80 /* FILE_ATTRIBUTE_NORMAL */, &mut shfi, std::mem::size_of::<SHFILEINFOW>() as u32, icon_flags | 0x10);
-        if res2 != 0 && !shfi.hIcon.is_null() {
-            return Some(shfi.hIcon);
-        }
+    let mut shfi: SHFILEINFOW = std::mem::zeroed();
+    let res = SHGetFileInfoW(path_w.as_ptr(), 0, &mut shfi, std::mem::size_of::<SHFILEINFOW>() as u32, icon_flags);
+    if res != 0 && !shfi.hIcon.is_null() {
+        Some(shfi.hIcon)
+    } else {
+        None
     }
-
-    // 5. If path not found or failed, try SHGetFileInfoW with proc_name directly
-    if !proc_name.is_empty() {
-        let name_clean = if proc_name.ends_with(".exe") { proc_name.to_string() } else { format!("{}.exe", proc_name) };
-        let name_w = wstr(&name_clean);
-        let mut shfi: SHFILEINFOW = std::mem::zeroed();
-        let res = SHGetFileInfoW(name_w.as_ptr(), 0x80, &mut shfi, std::mem::size_of::<SHFILEINFOW>() as u32, icon_flags | 0x10);
-        if res != 0 && !shfi.hIcon.is_null() {
-            return Some(shfi.hIcon);
-        }
-    }
-
-    None
 }
 
 // Double-Buffered Paint for Main Window
@@ -2432,15 +2373,15 @@ unsafe fn paint_main_double_buffered(hwnd: HWND, hdc: HDC, app: &App) {
     gdi32::SelectObject(mem_dc, old_p);
     let _ = gdi32::DeleteObject(p_pen);
 
-    // Process icon (or the syringe logo) drawn straight on the card, no box behind it,
-    // centred on the target input box (its top and bottom edges are at s(40) and s(72))
+    // Process icon drawn straight on the card, no box behind it, centred on the target
+    // input box (its top and bottom edges are at s(40) and s(72)). When there is no target
+    // (or its icon cannot be read) the slot stays empty; a placeholder logo here looked like
+    // a matched process.
     let icon_sz = s(40, scale);
     let icon_x = card_l + s(10, scale);
     let icon_y = (s(40, scale) + s(72, scale)) / 2 - icon_sz / 2;
     if let Some(hicon) = app.proc_icon {
         DrawIconEx(mem_dc, icon_x, icon_y, hicon, icon_sz, icon_sz, 0, NULL_HANDLE, 0x0003 /* DI_NORMAL */);
-    } else {
-        draw_syringe_logo(mem_dc, icon_x, icon_y, icon_sz, icon_sz);
     }
 
     // Card Header: TARGET PROCESS
@@ -2621,16 +2562,20 @@ unsafe fn poll_target_process_status(hwnd: HWND, app: &mut App) {
             if let Some(old_icon) = app.proc_icon.take() {
                 DestroyIcon(old_icon);
             }
-            app.proc_icon = fetch_process_icon(new_pid, trimmed);
+            app.proc_icon = fetch_process_icon(new_pid);
             let title = find_main_window_title(new_pid);
             app.proc_title = if title.is_empty() { trimmed.to_string() } else { title };
             app.proc_sub = format!("PID: {} (0x{:X})", new_pid, new_pid);
             invalidate_target_card(hwnd, scale);
         } else if current_pid != 0 || app.proc_sub != "PID: N/A" {
-            // Process terminated and no instance is running
+            // Process terminated and no instance is running. Drop its icon too, otherwise the
+            // card keeps showing the icon of a process that is gone.
             app.shared.lock().unwrap().target_pid = 0;
             app.proc_title = "Waiting for process...".to_string();
             app.proc_sub = "PID: N/A".to_string();
+            if let Some(old_icon) = app.proc_icon.take() {
+                DestroyIcon(old_icon);
+            }
             invalidate_target_card(hwnd, scale);
         }
     }
@@ -2652,7 +2597,11 @@ unsafe fn update_process_info_with_pid(hwnd: HWND, app: &mut App, proc_name: &st
     if let Some(old_icon) = app.proc_icon.take() {
         DestroyIcon(old_icon);
     }
-    app.proc_icon = fetch_process_icon(pid, proc_name);
+    // No pid means no running process matched the typed name. Leave the icon slot empty;
+    // a name-only lookup would return Windows' generic .exe icon for a process that is not there.
+    if pid > 0 {
+        app.proc_icon = fetch_process_icon(pid);
+    }
 
     if pid > 0 {
         let title = find_main_window_title(pid);
@@ -3366,7 +3315,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_DROPFILES => {
-            handle_drop_files(hwnd, wp as HANDLE, app);
+            // A null wp is a bare probe message, not an HDROP payload.
+            if wp != 0 {
+                handle_drop_files(hwnd, wp as HANDLE, app);
+            }
             0
         }
         WM_COMMAND => {
@@ -3468,10 +3420,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_APP_LOG => {
-            let ptr = wp as *mut String;
-            if !ptr.is_null() {
-                let s = *Box::from_raw(ptr);
-                push_log(app, &s);
+            // One repaint for a whole burst. The worker can post hundreds of lines while it
+            // maps an image; repainting the panel once per line made the UI crawl.
+            let mut ptr = wp as *mut String;
+            let mut drained = 0u32;
+            loop {
+                if !ptr.is_null() {
+                    let s = *Box::from_raw(ptr);
+                    push_log_no_invalidate(app, &s);
+                }
+                drained += 1;
+                let mut msg: MSG = std::mem::zeroed();
+                if drained >= 512
+                    || PeekMessageW(&mut msg, hwnd, WM_APP_LOG, WM_APP_LOG, PM_REMOVE) == 0
+                {
+                    break;
+                }
+                ptr = msg.wParam as *mut String;
+            }
+            let panel = log_panel_of(app);
+            if !panel.is_null() {
+                InvalidateRect(panel, std::ptr::null(), 0);
             }
             0
         }
@@ -4013,6 +3982,36 @@ unsafe fn show_context_menu_sub(
     ReleaseCapture();
     DestroyWindow(hwnd);
     (*stp).result
+}
+
+// This process runs at high integrity, while Explorer runs at medium. UIPI discards the
+// shell's WM_DROPFILES and its WM_COPYGLOBALDATA payload by default, so an elevated window
+// never sees a drop even though DragAcceptFiles is set. Allow just those two messages.
+#[repr(C)]
+struct ChangeFilterStruct {
+    cb_size: u32,
+    ext_status: u32,
+}
+
+unsafe fn install_file_drop_target(hwnd: HWND) -> Vec<(u32, u32)> {
+    DragAcceptFiles(hwnd, 1);
+    let mut failures = Vec::new();
+    for msg in [WM_DROPFILES, WM_COPYGLOBALDATA] {
+        let mut filter = ChangeFilterStruct {
+            cb_size: std::mem::size_of::<ChangeFilterStruct>() as u32,
+            ext_status: 0,
+        };
+        let ok = ChangeWindowMessageFilterEx(
+            hwnd,
+            msg,
+            MSGFLT_ALLOW,
+            &mut filter as *mut _ as *mut c_void_raw,
+        );
+        if ok == 0 {
+            failures.push((msg, kernel32::GetLastError()));
+        }
+    }
+    failures
 }
 
 unsafe fn handle_drop_files(hwnd: HWND, drop: HANDLE, app: &mut App) {
@@ -4728,9 +4727,16 @@ unsafe fn list_row_menu(hwnd: HWND, app: &mut App, row: i32, scale: u32) {
             if idx < sh.modules.len() {
                 let path = sh.modules[idx].path.clone();
                 drop(sh);
-                let _ = std::process::Command::new("explorer.exe")
-                    .arg(format!("/select,\"{}\"", path))
-                    .spawn();
+                // raw_arg appends the parameter verbatim. Command's normal quoting escapes the
+                // inner quotes for CommandLineToArgvW, which strips the quotes Explorer's own
+                // /select parser needs; that made Explorer open its default folder instead.
+                use std::os::windows::process::CommandExt;
+                if let Err(e) = std::process::Command::new("explorer.exe")
+                    .raw_arg(format!("/select,\"{}\"", path))
+                    .spawn()
+                {
+                    push_log(app, &format!("[!] Could not open file location: {e}"));
+                }
             }
         }
         _ => {}
@@ -5992,16 +5998,25 @@ unsafe fn log_panel_of(app: &App) -> HWND {
 
 /// Posts one line to the UI thread, which appends it to the in-window log.
 unsafe fn post_ui_log(hwnd: HWND, text: &str) {
-    PostMessageW(hwnd, WM_APP_LOG, Box::into_raw(Box::new(text.to_string())) as WPARAM, 0);
+    let ptr = Box::into_raw(Box::new(text.to_string()));
+    if PostMessageW(hwnd, WM_APP_LOG, ptr as WPARAM, 0) == 0 {
+        // Window is gone or the message queue is full: do not leak the box.
+        drop(Box::from_raw(ptr));
+    }
 }
 
-/// Appends a line to the in-window log (from the UI thread).
-unsafe fn push_log(app: &mut App, text: &str) {
+/// Appends a line without repainting. The caller repaints once after a burst.
+unsafe fn push_log_no_invalidate(app: &mut App, text: &str) {
     let level = log_level_for(text);
     if app.log.len() >= MAX_LOG_LINES {
         app.log.remove(0);
     }
     app.log.push((level, text.to_string()));
+}
+
+/// Appends a line to the in-window log (from the UI thread).
+unsafe fn push_log(app: &mut App, text: &str) {
+    push_log_no_invalidate(app, text);
     // If the user scrolled up to read, keep that position; otherwise stay at the newest line
     let panel = log_panel_of(app);
     if !panel.is_null() {
@@ -6164,18 +6179,21 @@ unsafe fn paint_log_panel(hwnd: HWND, app: &mut App) {
         let hint = wstr("No activity yet.");
         gdi32::DrawTextW(hdc, hint.as_ptr(), -1, &mut trc, DT_CENTER_FLAG | DT_VCENTER_FLAG | DT_SINGLELINE_FLAG | DT_NOPREFIX_FLAG);
     } else {
-        let mut wrapped: Vec<(String, LogLevel)> = Vec::new();
-        for (level, text) in app.log.iter().rev().take(400) {
-            let mut lines = wrap_log_text(hdc, text, text_w);
-            lines.reverse();
-            for l in lines {
-                wrapped.push((l, *level));
+        // Only wrap until the visible area is filled. The old code wrapped the newest 400
+        // entries on every paint, then drew 8-12 of them; a burst of progress lines spent most
+        // of the UI thread measuring text that was never shown.
+        let mut wrapped: Vec<(String, LogLevel)> = Vec::with_capacity(visible + 4);
+        'fill: for (level, text) in app.log.iter().rev().take(400) {
+            for line in wrap_log_text(hdc, text, text_w).into_iter().rev() {
+                wrapped.push((line, *level));
+                if wrapped.len() >= visible {
+                    break 'fill;
+                }
             }
         }
+        wrapped.truncate(visible);
         wrapped.reverse();
-        let total = wrapped.len();
-        let start = total.saturating_sub(visible);
-        for (i, (line, level)) in wrapped[start..].iter().enumerate() {
+        for (i, (line, level)) in wrapped.iter().enumerate() {
             let y = pad + (i as i32) * line_h;
             let mut trc = RECT { left: s(10, scale), top: y, right: w - s(12, scale), bottom: y + line_h };
             gdi32::SetTextColor(hdc, log_color(*level));
@@ -6399,7 +6417,7 @@ unsafe fn refresh_picker_if_changed(lv: HWND, filter: &str, windowed_only: bool,
             None => {
                 let key = name.to_ascii_lowercase();
                 let alternates = pids_by_name.get(&key).cloned().unwrap_or_default();
-                let idx = if let Some(hicon) = fetch_icon_with_alternates(*pid, name, true, &alternates) {
+                let idx = if let Some(hicon) = fetch_icon_with_alternates(*pid, true, &alternates) {
                     let r = ImageList_ReplaceIcon(state.himl, -1, hicon);
                     DestroyIcon(hicon);
                     r
@@ -6491,7 +6509,7 @@ unsafe fn update_picker_preview_card(hwnd: HWND, st: *mut PickerState) {
         if let Some(old) = (*st).selected_icon.take() {
             DestroyIcon(old);
         }
-        (*st).selected_icon = if name.is_empty() { None } else { fetch_process_icon_sized(pid, &name, false) };
+        (*st).selected_icon = if name.is_empty() || pid == 0 { None } else { fetch_process_icon_sized(pid, false) };
         let dlg_w = s(BASE_PICKER_W, (*st).scale);
         let mut rc = RECT {
             left: s(16, (*st).scale),
@@ -6558,12 +6576,8 @@ unsafe fn draw_picker_row(dis: &DRAWITEMSTRUCT, himl: HANDLE, scale: u32) {
             let icon_y = rc.top + (rc.bottom - rc.top - icon_sz) / 2;
             if icon >= 0 {
                 ImageList_Draw(himl, icon, hdc, col_left + pad, icon_y, ILD_TRANSPARENT_C);
-            } else {
-                let fallback = LoadIconW(NULL_HANDLE, 32512usize as *const u16);
-                if !fallback.is_null() {
-                    DrawIconEx(hdc, col_left + pad, icon_y, fallback, icon_sz, icon_sz, 0, NULL_HANDLE, 0x0003);
-                }
             }
+            // No icon means no icon: never paint the generic Windows application icon here.
             trc.left += icon_sz + s(8, scale);
         }
         let text_clr = if is_selected || sub == 0 { C_TEXT_BODY } else { C_TEXT_HEAD };
@@ -6593,7 +6607,7 @@ unsafe fn load_pending_icons(lv: HWND, state: &mut PickerState, budget: usize) {
         let icon_idx = match state.icon_cache.get(&cache_key) {
             Some(&c_idx) => c_idx,
             None => {
-                let new_idx = if let Some(hicon) = fetch_icon_with_alternates(item.pid, &item.name, true, &item.alternates) {
+                let new_idx = if let Some(hicon) = fetch_icon_with_alternates(item.pid, true, &item.alternates) {
                     let r = ImageList_ReplaceIcon(state.himl, -1, hicon);
                     DestroyIcon(hicon);
                     r
@@ -9013,7 +9027,12 @@ pub fn run() -> i32 {
         });
         push_log(&mut *app_ptr, "[*] Ready. Select target and add DLLs.");
 
-        DragAcceptFiles(hwnd, 1);
+        let drop_filter_failures = install_file_drop_target(hwnd);
+        if admin {
+            for (msg, err) in drop_filter_failures {
+                push_log(&mut *app_ptr, &format!("[!] File drop filter failed for message {msg:#x}: {err}"));
+            }
+        }
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);

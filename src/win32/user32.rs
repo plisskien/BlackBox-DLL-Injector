@@ -17,6 +17,10 @@ pub const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub const WM_CTLCOLORLISTBOX: u32 = 0x0134;
 pub const WM_CTLCOLORSCROLLBAR: u32 = 0x0137;
 pub const WM_DROPFILES: u32 = 0x0233;
+// Passed by the shell together with WM_DROPFILES when the drag source is at a lower
+// integrity level (Explorer) than the drop target (this elevated process).
+pub const WM_COPYGLOBALDATA: u32 = 0x0049;
+pub const MSGFLT_ALLOW: u32 = 1;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_MOUSEMOVE: u32 = 0x0200;
@@ -528,6 +532,12 @@ extern "system" {
     pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: LONG_PTR) -> LONG_PTR;
     pub fn GetParent(hwnd: HWND) -> HWND;
     pub fn DragAcceptFiles(hwnd: HWND, accept: BOOL);
+    pub fn ChangeWindowMessageFilterEx(
+        hwnd: HWND,
+        message: u32,
+        action: u32,
+        change_filter_struct: *mut c_void_raw,
+    ) -> BOOL;
     pub fn GetMessagePos() -> u32;
     pub fn ValidateRect(hwnd: HWND, rect: *const RECT) -> BOOL;
     pub fn GetForegroundWindow() -> HWND;

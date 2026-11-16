@@ -10,7 +10,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-2021-ea7233?style=flat-square" alt="Rust 2021">
   <img src="https://img.shields.io/badge/Windows-10_%7C_11-0078D4?style=flat-square" alt="Windows 10 | 11">
-  <img src="https://img.shields.io/badge/Version-1.0.2-059669?style=flat-square" alt="Version 1.0.2">
+  <img src="https://img.shields.io/badge/Version-1.0.3-059669?style=flat-square" alt="Version 1.0.3">
 </p>
 
 Native Windows DLL injection and diagnostic tool written in pure Rust. Supports native x64 and 32-bit WOW64 processes with 6 injection methods, in-memory cloaking, automated crash diagnostics, and scriptable CLI automation.
@@ -153,11 +153,7 @@ Legend: **✅** supported and verified | **⚠️** supported with a caveat (see
 11. **PE Scrambler:** Hijack loads the temporary scrambled copy. `ShiftSectionMemory` is intentionally bypassed with a clear warning because section memory shifting requires complete PE RVA rebasing.
 12. **Forwarded imports:** manual map resolves API-set contracts through the target's `ApiSetMap` (schema v6: 28-byte header, `EntryOffset` 0x1C, name compared up to the last hyphen because the schema stores revision `-l1-2-1` while binaries reference `-l1-2-0`, host DLL taken from `_API_SET_VALUE_ENTRY_V6.ValueOffset`). Verified in live CS2 with `kernel32!InitOnceExecuteOnce`, `InitOnceBeginInitialize` and `SleepConditionVariableCS`.
 13. **Multiple manual-mapped DLLs with static TLS:** every map registers its own loader TLS entry, so each manually mapped module receives a distinct loader-assigned `_tls_index` (verified: two loader-registered TLS DLLs mapped into one process got indices 8 and 9 and both kept working). Loader methods are unaffected.
-14. **CS2 Trusted Mode and static TLS:** `cs2.exe` reads `csgo.signatures`, `steam.signatures`, `system.signatures` and `foreign.signatures`, then installs inline hooks on `ntdll!NtOpenFile`, `kernelbase!LoadLibraryExW` and `user32!PeekMessageW` for the whole game session. The `NtOpenFile` hook verifies image opens that request `FILE_EXECUTE | FILE_READ_DATA` (the mask the native loader uses) and returns `STATUS_OBJECT_NAME_NOT_FOUND` for files that are not in the manifests. The loader-registration path never opens an image file: it calls `LdrpHandleTlsData` on the already-mapped image, so the gate is bypassed. It still adds loader-internal TLS state, so live VAC behaviour must be verified separately. `-allow_third_party_software` still installs the same hooks; only signed/allowlisted modules pass. `-insecure` skips the hooks but also disables VAC-secure play.
-15. **CS2 verification history:** the earlier live CS2 TLS-seed results predate the current `NtOpenFile` gate and are no longer applicable. The seed fallback was removed; the loader-registration path was verified against a target with `NtOpenFile` and `LoadLibraryExW` blocked, not against a live VAC-secured CS2 session.
-16. **User/environment errors:** a target that is no longer running reports `E2003 TARGET_NOT_RUNNING`, and a missing/undownloadable ntdll PDB reports `TLS-PDB-01`. Both use the normal error dialog and do not write a failure report - they are user/environment problems, not injector defects.
-
-**Verified on** Windows 10 IoT Enterprise LTSC 2024 (build 26100.7462) x64 with WOW64, against a purpose-built matrix of test DLLs (plain, TLS variables + callbacks, a DLL whose `DllMain` spawns a worker thread that reads `thread_local`, SEH + C++ exceptions, static CRT/STL, delay-load, API-set imports, CFG, `/NOENTRY`, `DllMain FALSE`, 8 s and 12 s `DllMain`, crash-on-attach) and both 64-bit and 32-bit targets. The loader-registration TLS path was verified with a target whose `ntdll!NtOpenFile` was blocked, a target whose `NtOpenFile` and `LoadLibraryExW` were both blocked, two TLS DLLs receiving indices 8 and 9, a pre-existing worker thread reading `thread_local` through an APC, and a payload-created thread reading it normally. The earlier live CS2 TLS-seed results predate the current `NtOpenFile` gate; see notes 14-15.
+**Verified on** Windows 10 IoT Enterprise LTSC 2024 (build 26100.7462) x64 with WOW64, against a purpose-built matrix of test DLLs (plain, TLS variables + callbacks, a DLL whose `DllMain` spawns a worker thread that reads `thread_local`, SEH + C++ exceptions, static CRT/STL, delay-load, API-set imports, CFG, `/NOENTRY`, `DllMain FALSE`, 8 s and 12 s `DllMain`, crash-on-attach) and both 64-bit and 32-bit targets. The loader-registration TLS path was verified with a target whose `ntdll!NtOpenFile` was blocked, a target whose `NtOpenFile` and `LoadLibraryExW` were both blocked, two TLS DLLs receiving indices 8 and 9, a pre-existing worker thread reading `thread_local` through an APC, and a payload-created thread reading it normally.
 
 ## Stealth & Memory Cloaking
 
@@ -195,6 +191,12 @@ Legend: **✅** supported and verified | **⚠️** supported with a caveat (see
 
 ## Changelog
 
+### 1.0.3
+- **Fixed:** drag-and-drop now works in the elevated build. The shell's `WM_DROPFILES` and `WM_COPYGLOBALDATA` messages are allowed through UIPI for the main window.
+- **Fixed:** **Open File Location** now selects the DLL in Explorer instead of opening Explorer's default folder. The `/select` argument is passed verbatim instead of being escaped by Rust's normal argument quoting.
+- **Fixed:** target cards and process-picker rows show nothing when no icon is available; the BlackBox logo, generic `.exe` icon and stale icon are no longer used as placeholders.
+- **Fixed:** a burst of manual-map progress lines no longer makes the UI lag. Log messages are coalesced into one repaint per burst, and only the visible log lines are wrapped and measured.
+
 ### 1.0.2
 - **Changed:** manual-map static TLS now registers the mapped image directly with `LdrpHandleTlsData`; the loader-visible seed DLL fallback was removed. The internal function is resolved from the matching ntdll PDB, cached in `%TEMP%\BlackBoxInjector\symbols`.
 - **Fixed:** a target that is already gone, or a missing/undownloadable ntdll PDB, now uses the normal error dialog (`E2003 TARGET_NOT_RUNNING` / `TLS-PDB-01`) and no longer writes a failure report.
@@ -208,11 +210,3 @@ Legend: **✅** supported and verified | **⚠️** supported with a caveat (see
 - Initial release: six injection methods, manual map with TLS and C++ exception support, cloaking, crash diagnostics, CLI.
 
 Full version history: [CHANGELOG.md](CHANGELOG.md)
-
-## Reporting Issues
-
-Bug reports and technical issues are tracked via **[GitHub Issues](https://github.com/plisskien/BlackBox-DLL-Injector/issues)**. Please do not report bugs on forum threads - GitHub keeps crashes and diagnostic dumps together with the source.
-
-Click **New issue** and choose **Bug Report**: GitHub loads `.github/ISSUE_TEMPLATE/bug_report.md` automatically, including the environment, diagnostic-report and activity-log fields.
-
-Before submitting, attach the newest report from `%TEMP%\BlackBoxInjector\reports\` and the log from the UI console or terminal. Both make triage much faster.
